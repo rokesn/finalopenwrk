@@ -19,6 +19,12 @@ const MENU_OVERLAY_WIDTH = 196;
 const MENU_OVERLAY_HEIGHT = 176;
 const MENU_OVERLAY_READY_TIMEOUT_MS = 2000;
 
+// Default dimensions for an OAuth / window.open popup when the opener does not
+// specify explicit width/height features (e.g. Google's "Continue with Google"
+// flow). Values match the dimensions Chrome itself uses for Google OAuth.
+const POPUP_DEFAULT_WIDTH = 500;
+const POPUP_DEFAULT_HEIGHT = 620;
+
 export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
   const browserTabs = new Map();
   let browserTabOrder = [];
@@ -35,6 +41,9 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
   let menuOverlayReady = false;
   let menuOverlayReadyResolvers = [];
   let menuOverlayShowSerial = 0;
+  // Popups created by window.open() — kept as parented BrowserWindows so
+  // window.opener / postMessage / window.close() keep working natively.
+  const popupWindows = new Set();
 
   function window() {
     return getWindow?.() ?? null;
@@ -75,6 +84,51 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
     const mainWindow = window();
     if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
     try { mainWindow.webContents.send(channel, payload); } catch { /* window closing */ }
+  }
+
+  // ---------------------------------------------------------------------------
+  // In-app popup management — parented BrowserWindows
+  // We keep OAuth popups as real (parented) BrowserWindows. That preserves
+  // window.opener / postMessage / window.close() natively and automatically
+  // inherits the opener's persist:openwork-browser session for cookie sharing.
+  // ---------------------------------------------------------------------------
+
+  function closeAllPopups() {
+    for (const w of [...popupWindows]) {
+      try { if (!w.isDestroyed()) w.close(); } catch { /* gone */ }
+    }
+    popupWindows.clear();
+  }
+
+  function positionAndShowPopup(childWindow, details) {
+    const mainWindow = window();
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      try { childWindow.close(); } catch { /* gone */ }
+      return;
+    }
+    let w = POPUP_DEFAULT_WIDTH;
+    let h = POPUP_DEFAULT_HEIGHT;
+    try {
+      const feats = String(details?.features ?? "");
+      const wm = feats.match(/\bwidth\s*=\s*(\d+)/i);
+      const hm = feats.match(/\bheight\s*=\s*(\d+)/i);
+      if (wm) w = Math.min(Math.max(parseInt(wm[1], 10), 200), 1200);
+      if (hm) h = Math.min(Math.max(parseInt(hm[1], 10), 200), 1000);
+    } catch { /* use defaults */ }
+
+    try {
+      const b = mainWindow.getBounds();
+      const x = Math.round(b.x + (b.width - w) / 2);
+      const y = Math.round(b.y + (b.height - h) / 2);
+      childWindow.setBounds({ x, y, width: w, height: h });
+    } catch { /* use Electron default position */ }
+
+    try { childWindow.setParentWindow(mainWindow); } catch { /* no parent support */ }
+    try {
+      if (childWindow.isDestroyed()) return;
+      childWindow.show();
+      childWindow.focus();
+    } catch { /* gone */ }
   }
 
   function createBrowserTabId() {
@@ -488,8 +542,75 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
     // Cookies live on the session object, not the document — they survive this.
     view.webContents.loadURL("about:blank");
     view.webContents.setWindowOpenHandler(({ url: targetUrl }) => {
-      void shell.openExternal(targetUrl);
+      const isInApp =
+        !targetUrl || targetUrl === "about:blank" || /^https?:\/\//i.test(targetUrl);
+      if (isInApp) {
+        return {
+          action: "allow",
+          overrideBrowserWindowOptions: {
+            show: false,
+            autoHideMenuBar: true,
+            width: POPUP_DEFAULT_WIDTH,
+            height: POPUP_DEFAULT_HEIGHT,
+            webPreferences: {
+              partition: BROWSER_SESSION_PARTITION,
+              sandbox: true,
+              contextIsolation: true,
+              nodeIntegration: false,
+              preload: path.join(__dirname, "browser-content-preload.cjs"),
+            },
+          },
+        };
+      }
+      if (targetUrl) void shell.openExternal(targetUrl).catch(() => {});
       return { action: "deny" };
+    });
+    view.webContents.on("did-create-window", (childWindow, details) => {
+      popupWindows.add(childWindow);
+      childWindow.once("closed", () => popupWindows.delete(childWindow));
+
+      // Handle openwork:// deep links inside the popup
+      childWindow.webContents.on("did-start-navigation", (_e, navUrl, isInPlace, isMainFrame) => {
+        if (!isMainFrame || isInPlace) return;
+        const t = String(navUrl ?? "");
+        if (t.startsWith("openwork://") || t.startsWith("openwork-dev://")) {
+          if (typeof onDeepLink === "function") onDeepLink([t]);
+          try { childWindow.close(); } catch { /* gone */ }
+        }
+      });
+
+      // Allow nested popups from within the popup itself
+      childWindow.webContents.setWindowOpenHandler(({ url: targetUrl }) => {
+        const isInApp =
+          !targetUrl || targetUrl === "about:blank" || /^https?:\/\//i.test(targetUrl);
+        if (isInApp) {
+          return {
+            action: "allow",
+            overrideBrowserWindowOptions: {
+              show: false,
+              autoHideMenuBar: true,
+              width: POPUP_DEFAULT_WIDTH,
+              height: POPUP_DEFAULT_HEIGHT,
+              webPreferences: {
+                partition: BROWSER_SESSION_PARTITION,
+                sandbox: true,
+                contextIsolation: true,
+                nodeIntegration: false,
+                preload: path.join(__dirname, "browser-content-preload.cjs"),
+              },
+            },
+          };
+        }
+        if (targetUrl) void shell.openExternal(targetUrl).catch(() => {});
+        return { action: "deny" };
+      });
+      childWindow.webContents.on("did-create-window", (nested, nestedDetails) => {
+        popupWindows.add(nested);
+        nested.once("closed", () => popupWindows.delete(nested));
+        positionAndShowPopup(nested, nestedDetails);
+      });
+
+      positionAndShowPopup(childWindow, details);
     });
     view.webContents.on("did-start-navigation", (_event, targetUrl, isInPlace, isMainFrame) => {
       if (!isMainFrame || isInPlace) return;
@@ -503,9 +624,6 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
         if (typeof onDeepLink === "function") {
           onDeepLink([target]);
         }
-        // Navigate the tab to about:blank to prevent the custom-scheme load
-        // from erroring, then hide the panel. Avoid closing the tab
-        // synchronously during a navigation event to prevent renderer crashes.
         setTimeout(() => {
           try {
             if (!view.webContents.isDestroyed()) {
@@ -728,6 +846,7 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
   }
 
   function destroyBrowserView() {
+    closeAllPopups();
     hideBrowserView();
     const overlayView = menuOverlayView;
     menuOverlayView = null;
