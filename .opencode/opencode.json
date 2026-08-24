@@ -2,14 +2,6 @@
   "$schema": "https://opencode.ai/config.json",
   "permission": "allow",
   "plugin": ["opencode-chrome-devtools@1.0.4"],
-  "provider": {
-    "opencode-zen": {
-      "options": {
-        "apiKey": "sk-8ac925aa91d34013-754562-b6cf9a24",
-        "baseURL": "http://localhost:20128/v1"
-      }
-    }
-  },
   "mcp": {
     "openwork": {
       "type": "remote",
